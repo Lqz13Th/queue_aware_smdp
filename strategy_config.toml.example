@@ -1,0 +1,37 @@
+[collector]
+host_id = "local"
+data_root = "data"
+writer_capacity = 32768
+flush_interval_ms = 250
+sync_interval_sec = 5
+zstd_level = 3
+schedule_interval_ms = 100
+account_snapshot_interval_sec = 30
+system_snapshot_interval_sec = 30
+
+[markets]
+hyperliquid_instrument = "XYZ100_USDC_PERP"
+hyperliquid_coin = "xyz:XYZ100"
+hyperliquid_perp_dex = "xyz"
+binance_instrument = "QQQ_USDT_PERP"
+okx_instrument = "QQQ_USDT_PERP"
+
+[probe]
+enabled = false
+i_understand_live_orders = false
+probe_notional_usd = 12.0
+max_order_notional_usd = 15.0
+max_abs_inventory_usd = 20.0
+price_levels_ticks = [0, 1]
+dwell_seconds = [30, 60, 120, 300]
+keep_interval_ms = 5000
+cooldown_ms = 10000
+market_freshness_ms = 2000
+default_l2_freshness_ms = 15000
+cancel_timeout_ms = 5000
+post_timeout_ms = 5000
+markout_horizons_ms = [100, 500, 1000, 5000]
+ioc_slippage_bps = 20.0
+fair_value_guard_ticks = 2.0
+behavior_seed = 20260827
+behavior_policy_id = "uniform_probe_v1"
