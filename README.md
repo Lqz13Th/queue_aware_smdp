@@ -97,6 +97,14 @@ does not currently expose its socket-read monotonic timestamp, so
 It preserves same-process causal order but must not be presented as exact
 socket-read latency.
 
+## Install
+
+Install the published binary from crates.io:
+
+```bash
+cargo install queue_aware_smdp
+```
+
 ## Run
 
 Copy the example configuration to `strategy_config.toml`, then provide the
@@ -105,6 +113,12 @@ by `extrema_infra`.
 
 ```bash
 cargo run --release -- --config strategy_config.toml
+```
+
+An installed binary can be started with the same configuration:
+
+```bash
+queue_aware_smdp --config strategy_config.toml
 ```
 
 With `probe.enabled = false`, all configured public/private streams and REST
