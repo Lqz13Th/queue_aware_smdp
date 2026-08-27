@@ -2,9 +2,14 @@
 name = "queue_aware_smdp"
 version = "0.1.0"
 edition = "2024"
-publish = false
 readme = "README.md"
+license = "Apache-2.0"
 description = "Controlled execution probes and immutable telemetry for Queue-Aware SMDP research."
+repository = "https://github.com/Lqz13Th/queue_aware_smdp"
+homepage = "https://github.com/Lqz13Th/queue_aware_smdp"
+documentation = "https://docs.rs/queue_aware_smdp"
+keywords = ["trading", "market-making", "hyperliquid", "quant", "smdp"]
+categories = ["finance", "command-line-utilities"]
 
 [lib]
 name = "queue_aware_smdp"

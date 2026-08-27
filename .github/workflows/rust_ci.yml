@@ -117,8 +117,8 @@ jobs:
       - name: Run cargo deny
         run: cargo deny check
 
-  release-build:
-    name: Release build
+  package:
+    name: Package dry-run
     runs-on: ubuntu-latest
 
     steps:
@@ -126,5 +126,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
-        run: cargo build --release --all-features
+      - name: Check packaged files
+        run: cargo package --list
+
+      - name: Verify publish package
+        run: cargo publish --dry-run --all-features
