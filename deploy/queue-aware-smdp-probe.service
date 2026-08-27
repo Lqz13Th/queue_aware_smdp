@@ -1,0 +1,16 @@
+[Unit]
+Description=Queue-Aware SMDP execution probe collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/queue_aware_smdp
+EnvironmentFile=-/root/queue_aware_smdp/.env
+ExecStart=/root/queue_aware_smdp/queue_aware_smdp --config /root/queue_aware_smdp/deploy/probe.a2.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

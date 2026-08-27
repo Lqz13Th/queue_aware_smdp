@@ -1,0 +1,67 @@
+# ===== AI Agent =====
+**/AGENTS.md
+**/CLAUDE.md
+.claude/
+
+# ===== IDE / OS =====
+.cursor/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ===== Python Virtual Env =====
+env/
+.venv/
+venv/
+ENV/
+**/.env
+**/.env.*
+
+# ===== Data Files =====
+*.csv
+*.parquet
+*.h5
+*.pkl
+*.joblib
+*.npz
+*.npy
+*.zip
+*.env
+
+infra_logs/
+runs/
+saved_models/
+models_ensemble/
+resampled_data/
+merged_alt_data/
+binance_data/
+datas/
+data/
+*.log
+
+# ===== Sensitive Configs (Global) =====
+**/strategy_config.toml
+**/model_config.json
+**/trader_config.json
+**/account_config.json
+**/instrument_config.json
+**/symbol_config.json
+**/symbols.json
+
+# ===== Rust =====
+target/
+**/target/
+**/Cargo.lock
+
+# ===== Python / uv =====
+**/uv.lock
+**/.python-version
+**/.python-version.*
+
+# ===== Python Garbage =====
+**/__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+.jupyter/
