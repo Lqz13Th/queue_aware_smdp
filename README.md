@@ -59,17 +59,65 @@ execution host.
 ## Probe boundary
 
 ```text
-size:                 current minimum valid XYZ100 quantity
-side:                 bid or ask
-price:                BBO or one tick behind BBO
-planned dwell:        30 / 60 / 120 / 300 seconds
-time in force:        ALO
-priority fee:         0
-maximum active probe: 1
+size:                  current minimum valid XYZ100 quantity
+side:                  bid or ask
+price level from BBO:  0 / 1 / 2 / 3 / 5 / 8 ticks
+planned open dwell:    30 / 60 / 120 / 300 seconds
+candidate cells:       2 sides x 6 levels x 4 dwell = 48
+time in force:         ALO
+priority fee:          0
+maximum active probe:  1
 ```
 
 Increasing size is not a remedy for sparse fills. The experiment varies side,
 price level, dwell, and session while keeping the order economically small.
+The price level is measured from the same-side Hyperliquid BBO. Planned dwell
+starts at the first private `orderUpdates=open`, not at PLACE socket write.
+Each cell is selected uniformly with replacement and its probability is stored
+in the decision record.
+
+`price_level_ticks` is the placement-time experiment cell, not the order's
+permanent distance from the market. The order price remains fixed while the
+book moves. Decision, fill, and terminal records therefore also contain the
+current BBO distance, fair-value distance in ticks and basis points, spread,
+open age, and remaining dwell. A negative current distance means that the
+resting quote has become stale relative to the latest market, not that its
+original cell was mislabeled.
+
+## Probe lifecycle
+
+```text
+wait for eligibility
+    -> sample one of 48 cells
+    -> send one ALO PLACE over the Hyperliquid action websocket
+    -> correlate post response, private orderUpdates, and REST state
+    -> start dwell on the first private orderUpdates=open
+    -> record KEEP decisions every keep_interval_ms while exposure is valid
+    -> finish through cancel or fill
+    -> collect 100 / 500 / 1000 / 5000 ms markouts for every fill
+    -> flatten non-zero inventory with a reduce-only IOC
+    -> reconcile zero open orders and zero inventory
+    -> finalize the probe and enter cooldown
+```
+
+`KEEP` is decision telemetry; it does not send an exchange action. An unfilled
+order is cancelled after its planned open dwell. A partial fill causes the
+remaining maker quantity to be cancelled before markout and flattening. The
+collector can end exposure earlier when market data is stale, the quote moves
+outside the fair-value guard, storage backpressure becomes unsafe, or a hard
+inventory limit is reached. Post, cancel, and flatten timeouts enter explicit
+recovery and REST reconciliation rather than silently starting another probe.
+
+The queue belief is an interval estimate derived from aggregate book and trade
+events. It records visible size, order count, adds, removals, same-price taker
+flow, and lower/upper queue-ahead bounds; it is not represented as an exact
+FIFO position.
+
+Each fill links back to its probe, decision, action, CLOID, and exchange order
+ID. Fill telemetry retains the exchange fee and derives the realized fee rate
+and fee in ticks alongside the account's maker/taker fee schedule. Flatten
+fills are linked separately so passive execution economics and forced exit
+costs can be analyzed independently.
 
 ## Raw storage contract
 
@@ -77,12 +125,12 @@ price level, dwell, and session while keeping the order economically small.
 runs/<run_id>/
 ├── manifest.json
 └── raw/
-    ├── public_market.jsonl.zst
-    ├── private_ws.jsonl.zst
-    ├── decisions.jsonl.zst
-    ├── actions.jsonl.zst
-    ├── account_snapshots.jsonl.zst
-    └── system.jsonl.zst
+    ├── public_market.part-<UTC-hour>.jsonl.zst
+    ├── private_ws.part-<UTC-hour>.jsonl.zst
+    ├── decisions.part-<UTC-hour>.jsonl.zst
+    ├── actions.part-<UTC-hour>.jsonl.zst
+    ├── account_snapshots.part-<UTC-hour>.jsonl.zst
+    └── system.part-<UTC-hour>.jsonl.zst
 ```
 
 Files rotate hourly. The active file ends in `.jsonl.partial`; clean shutdown
@@ -90,6 +138,11 @@ or rotation produces `.jsonl.zst` plus a `.sha256` sidecar. Raw files are
 append-only and immutable after finalization. Credentials, private keys, and
 environment variables are never persisted. Signed outbound action payloads
 are retained because they are part of the causal execution record.
+
+The recorded candidate set, selected action, selection probability, policy ID,
+seed, and build commit are the authoritative behavior-policy trace. A seed by
+itself is not a stable replay contract across dependency or RNG implementation
+upgrades.
 
 `WsOtherMessage.timestamp` is the infra socket-receive wall timestamp. Infra
 does not currently expose its socket-read monotonic timestamp, so

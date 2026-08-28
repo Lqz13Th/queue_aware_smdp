@@ -20,7 +20,7 @@ use tokio::{
 use extrema_infra::errors::{InfraError, InfraResult};
 
 use super::{
-    execution_probe_module::utils::CollectorConfig,
+    execution_probe_module::utils::{CollectorConfig, lower_hex},
     schema::{RunManifest, SCHEMA_VERSION},
 };
 
@@ -360,7 +360,7 @@ fn sha256_file(path: &Path) -> InfraResult<String> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(lower_hex(hasher.finalize().as_ref()))
 }
 
 fn utc_hour_key() -> String {
