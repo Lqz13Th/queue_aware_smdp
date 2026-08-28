@@ -22,7 +22,7 @@ use extrema_infra::{
 use super::{
     execution_probe_module::{
         state::ProbeSide,
-        utils::{ProcessClock, TASK_HL_ACTION},
+        utils::{ProcessClock, TASK_HL_ACTION, lower_hex},
     },
     schema::{ActionRecord, EventEnvelope},
 };
@@ -383,7 +383,7 @@ fn order_side(side: ProbeSide) -> OrderSide {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    lower_hex(Sha256::digest(bytes).as_ref())
 }
 
 impl CommandEmitter for ActionGateway {
@@ -412,5 +412,13 @@ mod tests {
         });
         assert_eq!(place_outcome(&resting).unwrap(), PlaceOutcome::Resting(42));
         assert!(cancel_succeeded(&canceled).is_ok());
+    }
+
+    #[test]
+    fn sha256_hash_format_is_stable() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

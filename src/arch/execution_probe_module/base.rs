@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use serde_json::{Value, json};
 use tokio::{
     process::Command,
@@ -89,6 +89,14 @@ struct RestRequestGate {
     last_request_ns: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProbeDistanceMetrics {
+    current_bbo_distance_ticks: Option<f64>,
+    current_fair_value_distance_ticks: Option<f64>,
+    current_fair_value_distance_bps: Option<f64>,
+    current_spread_ticks: Option<f64>,
+}
+
 impl RestRequestGate {
     fn try_begin(&mut self, now_ns: u64, minimum_interval_ns: u64) -> bool {
         if self.pending || now_ns.saturating_sub(self.last_request_ns) < minimum_interval_ns {
@@ -125,7 +133,7 @@ pub struct ExecutionProbe {
     active_probe: Option<ActiveProbe>,
     pending_markouts: Vec<PendingMarkout>,
     seen_fill_ids: HashSet<String>,
-    rng: StdRng,
+    rng: SmallRng,
     event_sequence: u64,
     probe_sequence: u64,
     decision_sequence: u64,
@@ -199,7 +207,7 @@ pub async fn build_probe(
         active_probe: None,
         pending_markouts: Vec::new(),
         seen_fill_ids: HashSet::new(),
-        rng: StdRng::seed_from_u64(config.probe.behavior_seed),
+        rng: SmallRng::seed_from_u64(config.probe.behavior_seed),
         event_sequence: 0,
         probe_sequence: 0,
         decision_sequence: 0,
@@ -553,7 +561,8 @@ impl ExecutionProbe {
                 PlaceOutcome::Resting(oid) => {
                     if let Some(probe) = self.active_probe.as_mut() {
                         probe.oid = Some(oid);
-                        probe.phase = ProbePhase::PostAccepted;
+                        probe.phase = phase_after_resting_post(probe.phase);
+                        probe.post_accepted_monotonic_ns = Some(self.identity.clock.monotonic_ns());
                     }
                     self.record_system(
                         "place_post_accepted",
@@ -564,7 +573,8 @@ impl ExecutionProbe {
                 PlaceOutcome::Filled(oid) => {
                     if let Some(probe) = self.active_probe.as_mut() {
                         probe.oid = Some(oid);
-                        probe.phase = ProbePhase::Filled;
+                        probe.phase = phase_after_filled_post(probe.phase);
+                        probe.post_accepted_monotonic_ns = Some(self.identity.clock.monotonic_ns());
                     }
                     self.record_system(
                         "place_immediate_fill",
@@ -676,6 +686,9 @@ impl ExecutionProbe {
                 };
                 if first_open {
                     probe.open_monotonic_ns = Some(now_ns);
+                    probe.planned_expiry_monotonic_ns =
+                        planned_expiry_from_open(now_ns, probe.planned_dwell_ms);
+                    probe.last_keep_monotonic_ns = now_ns;
                     let tick = probe.tick_size;
                     let level = self
                         .market
@@ -701,6 +714,7 @@ impl ExecutionProbe {
                     .cumulative_filled_size
                     .max(update.original_size - update.remaining_size);
                 probe.phase = ProbePhase::MarkoutPending;
+                probe.terminal_order_update_monotonic_ns = Some(received_ns);
             }
         } else if status.contains("cancel") {
             let update_filled_size = (update.original_size - update.remaining_size).max(0.0);
@@ -723,6 +737,7 @@ impl ExecutionProbe {
                     probe.cumulative_filled_size =
                         probe.cumulative_filled_size.max(update_filled_size);
                     probe.phase = ProbePhase::MarkoutPending;
+                    probe.terminal_order_update_monotonic_ns = Some(received_ns);
                 }
             } else {
                 if let Some(probe) = self.active_probe.as_mut() {
@@ -763,10 +778,17 @@ impl ExecutionProbe {
             return Ok(());
         }
         let flatten_link = self.active_probe.as_ref().and_then(|probe| {
-            (probe.flatten_oid == Some(fill.oid))
-                .then(|| (probe.probe_id.clone(), probe.flatten_action_id.clone()))
+            (probe.flatten_oid == Some(fill.oid)).then(|| {
+                (
+                    probe.probe_id.clone(),
+                    probe.flatten_action_id.clone(),
+                    probe.tick_size,
+                )
+            })
         });
-        if let Some((probe_id, action_id)) = flatten_link {
+        if let Some((probe_id, action_id, tick_size)) = flatten_link {
+            let (realized_fee_rate, realized_fee_ticks) =
+                realized_fee_metrics(fill.fee, fill.price, fill.size, tick_size);
             self.account.confirmed_inventory += fill.side.order_sign() * fill.size;
             self.account.snapshot_monotonic_ns = received_ns;
             self.record_system_to(
@@ -782,6 +804,13 @@ impl ExecutionProbe {
                     "side": fill.side,
                     "fee": fill.fee,
                     "fee_token": fill.fee_token,
+                    "realized_fee_rate": realized_fee_rate,
+                    "realized_fee_ticks": realized_fee_ticks,
+                    "user_add_rate": self.account.maker_fee,
+                    "user_cross_rate": self.account.taker_fee,
+                    "active_referral_discount": self.account.active_referral_discount,
+                    "growth_mode": self.account.growth_mode.as_deref(),
+                    "deployer_fee_scale": self.account.deployer_fee_scale.as_deref(),
                     "exchange_time_ms": fill.timestamp_ms,
                     "raw_fill": fill.raw,
                 }),
@@ -818,6 +847,8 @@ impl ExecutionProbe {
             queue_belief,
             cumulative_filled_size,
             remaining_size,
+            tick_size,
+            price_level_ticks,
         ) = {
             let probe = self.active_probe.as_mut().expect("checked active probe");
             let order_age_ms = received_ns
@@ -830,6 +861,7 @@ impl ExecutionProbe {
             probe.phase = if probe.remaining_size > 0.0 {
                 ProbePhase::Partial
             } else {
+                probe.terminal_order_update_monotonic_ns = Some(received_ns);
                 ProbePhase::MarkoutPending
             };
             (
@@ -843,6 +875,8 @@ impl ExecutionProbe {
                 probe.queue_belief.clone(),
                 probe.cumulative_filled_size,
                 probe.remaining_size,
+                probe.tick_size,
+                probe.price_level_ticks,
             )
         };
         self.account.confirmed_inventory += side.order_sign() * fill.size;
@@ -852,6 +886,9 @@ impl ExecutionProbe {
             ProbeSide::Bid => fair - fill.price,
             ProbeSide::Ask => fill.price - fair,
         });
+        let distance = probe_distance_metrics(&self.market, side, fill.price, tick_size);
+        let (realized_fee_rate, realized_fee_ticks) =
+            realized_fee_metrics(fill.fee, fill.price, fill.size, tick_size);
         self.pending_markouts.push(PendingMarkout {
             probe_id: probe_id.clone(),
             oid: fill.oid,
@@ -881,12 +918,24 @@ impl ExecutionProbe {
                 "fair_value": fair_value,
                 "spread_edge_at_fill": spread_edge_at_fill,
                 "maker_fee_rate": self.account.maker_fee,
+                "user_add_rate": self.account.maker_fee,
+                "user_cross_rate": self.account.taker_fee,
+                "active_referral_discount": self.account.active_referral_discount,
+                "growth_mode": self.account.growth_mode.as_deref(),
+                "deployer_fee_scale": self.account.deployer_fee_scale.as_deref(),
+                "realized_fee_rate": realized_fee_rate,
+                "realized_fee_ticks": realized_fee_ticks,
                 "priority_fee": 0,
                 "inventory_before": inventory_before,
                 "inventory_after": inventory_after,
                 "cumulative_filled_size": cumulative_filled_size,
                 "remaining_size_after_fill": remaining_size,
                 "order_age_ms": order_age_ms,
+                "price_level_ticks": price_level_ticks,
+                "current_bbo_distance_ticks": distance.current_bbo_distance_ticks,
+                "current_fair_value_distance_ticks": distance.current_fair_value_distance_ticks,
+                "current_fair_value_distance_bps": distance.current_fair_value_distance_bps,
+                "current_spread_ticks": distance.current_spread_ticks,
                 "queue_belief": queue_belief,
                 "exchange_time_ms": fill.timestamp_ms,
                 "raw_fill": fill.raw,
@@ -1177,7 +1226,8 @@ impl ExecutionProbe {
         let cloid = make_cloid(&self.identity.run_id, self.probe_sequence);
         let decision_id = self.next_decision_id();
         let action_id = self.next_action_id();
-        let planned_expiry_ns = now_ns + dwell_sec * 1_000_000_000;
+        // The actual dwell window starts only after private WS confirms `open`.
+        let planned_expiry_ns = u64::MAX;
         let decision = self.build_decision(
             &probe_id,
             &decision_id,
@@ -1193,7 +1243,7 @@ impl ExecutionProbe {
                 "time_in_force": "Alo",
             }),
             1.0 / candidates.len() as f64,
-            Some(wall_time_ns()?.saturating_add(dwell_sec * 1_000_000_000)),
+            None,
             self.config.probe.behavior_seed,
             vec!["eligible_probe_cell".into()],
         );
@@ -1238,6 +1288,7 @@ impl ExecutionProbe {
             phase: ProbePhase::PlacePending,
             created_monotonic_ns: now_ns,
             send_monotonic_ns: sent.socket_write_monotonic_ns,
+            post_accepted_monotonic_ns: None,
             open_monotonic_ns: None,
             first_fill_monotonic_ns: None,
             planned_expiry_monotonic_ns: planned_expiry_ns,
@@ -1264,6 +1315,7 @@ impl ExecutionProbe {
             phase,
             probe_id,
             send_ns,
+            post_accepted_ns,
             cancel_send_ns,
             flatten_send_ns,
             expiry_ns,
@@ -1274,6 +1326,7 @@ impl ExecutionProbe {
                 probe.phase,
                 probe.probe_id.clone(),
                 probe.send_monotonic_ns,
+                probe.post_accepted_monotonic_ns,
                 probe.cancel_send_monotonic_ns,
                 probe.flatten_send_monotonic_ns,
                 probe.planned_expiry_monotonic_ns,
@@ -1295,6 +1348,20 @@ impl ExecutionProbe {
             self.request_rest("place_timeout", RestScope::Reconciliation);
             return self
                 .record_system("place_timeout", json!({"probe_id": probe_id}))
+                .await;
+        }
+        if phase == ProbePhase::PostAccepted
+            && post_accepted_ns.is_some_and(|accepted_ns| {
+                now_ns.saturating_sub(accepted_ns) >= self.config.probe.post_timeout_ms * 1_000_000
+            })
+        {
+            if let Some(probe) = self.active_probe.as_mut() {
+                probe.phase = ProbePhase::Recovering;
+                probe.recovery_not_before_monotonic_ns = now_ns;
+            }
+            self.request_rest("order_open_timeout", RestScope::Reconciliation);
+            return self
+                .record_system("order_open_timeout", json!({"probe_id": probe_id}))
                 .await;
         }
         if phase == ProbePhase::CancelPending
@@ -1729,7 +1796,18 @@ impl ExecutionProbe {
 
     async fn finish_probe(&mut self, reason: &str) -> InfraResult<()> {
         let now_ns = self.identity.clock.monotonic_ns();
+        let final_distance = self.active_probe.as_ref().map(|probe| {
+            probe_distance_metrics(&self.market, probe.side, probe.price, probe.tick_size)
+        });
         if let Some(probe) = self.active_probe.take() {
+            let exposure_end_ns = probe
+                .terminal_order_update_monotonic_ns
+                .or(probe.first_fill_monotonic_ns)
+                .unwrap_or(now_ns);
+            let actual_open_dwell_ms = probe
+                .open_monotonic_ns
+                .map(|open_ns| exposure_end_ns.saturating_sub(open_ns) / 1_000_000);
+            let distance = final_distance.unwrap_or_default();
             self.record_system(
                 "probe_finalized",
                 json!({
@@ -1740,10 +1818,19 @@ impl ExecutionProbe {
                     "size": probe.size,
                     "filled_size": probe.cumulative_filled_size,
                     "first_fill_monotonic_ns": probe.first_fill_monotonic_ns,
+                    "open_monotonic_ns": probe.open_monotonic_ns,
                     "planned_dwell_ms": probe.planned_dwell_ms,
                     "flatten_oid": probe.flatten_oid,
                     "flatten_action_id": probe.flatten_action_id,
                     "actual_dwell_ms": now_ns.saturating_sub(probe.created_monotonic_ns) / 1_000_000,
+                    "actual_open_dwell_ms": actual_open_dwell_ms,
+                    "place_to_open_ms": probe.open_monotonic_ns.map(|open_ns| open_ns.saturating_sub(probe.send_monotonic_ns) / 1_000_000),
+                    "post_to_open_ms": probe.open_monotonic_ns.zip(probe.post_accepted_monotonic_ns).map(|(open_ns, post_ns)| open_ns.saturating_sub(post_ns) / 1_000_000),
+                    "price_level_ticks": probe.price_level_ticks,
+                    "current_bbo_distance_ticks": distance.current_bbo_distance_ticks,
+                    "current_fair_value_distance_ticks": distance.current_fair_value_distance_ticks,
+                    "current_fair_value_distance_bps": distance.current_fair_value_distance_bps,
+                    "current_spread_ticks": distance.current_spread_ticks,
                     "end_reason": reason,
                     "exposure_trigger": probe.end_reason,
                     "censored": probe.cumulative_filled_size <= 0.0,
@@ -1912,6 +1999,9 @@ impl ExecutionProbe {
 
     fn execution_snapshot(&self, now_ns: u64) -> Value {
         let active = self.active_probe.as_ref();
+        let distance = active.map(|probe| {
+            probe_distance_metrics(&self.market, probe.side, probe.price, probe.tick_size)
+        });
         let pending_bid_inventory = active
             .filter(|probe| probe.side == ProbeSide::Bid)
             .map(|probe| probe.remaining_size)
@@ -1928,12 +2018,20 @@ impl ExecutionProbe {
                 "oid": probe.oid,
                 "phase": probe.phase,
                 "side": probe.side,
+                "price_level_ticks": probe.price_level_ticks,
                 "price": probe.price,
                 "tick_size": probe.tick_size,
                 "size": probe.size,
                 "remaining_size": probe.remaining_size,
                 "filled_size": probe.cumulative_filled_size,
                 "order_age_ms": now_ns.saturating_sub(probe.open_monotonic_ns.unwrap_or(probe.send_monotonic_ns)) / 1_000_000,
+                "open_age_ms": probe.open_monotonic_ns.map(|open_ns| now_ns.saturating_sub(open_ns) / 1_000_000),
+                "planned_dwell_ms": probe.planned_dwell_ms,
+                "remaining_dwell_ms": probe.open_monotonic_ns.map(|_| probe.planned_expiry_monotonic_ns.saturating_sub(now_ns) / 1_000_000),
+                "current_bbo_distance_ticks": distance.and_then(|value| value.current_bbo_distance_ticks),
+                "current_fair_value_distance_ticks": distance.and_then(|value| value.current_fair_value_distance_ticks),
+                "current_fair_value_distance_bps": distance.and_then(|value| value.current_fair_value_distance_bps),
+                "current_spread_ticks": distance.and_then(|value| value.current_spread_ticks),
                 "queue_belief": probe.queue_belief,
             })),
             "risk": {
@@ -1946,6 +2044,9 @@ impl ExecutionProbe {
                 "withdrawable": self.account.withdrawable,
                 "maker_fee": self.account.maker_fee,
                 "taker_fee": self.account.taker_fee,
+                "active_referral_discount": self.account.active_referral_discount,
+                "growth_mode": self.account.growth_mode.as_deref(),
+                "deployer_fee_scale": self.account.deployer_fee_scale.as_deref(),
                 "action_budget_remaining": self.account.action_budget_remaining(),
                 "writer_remaining_capacity": self.storage.remaining_capacity(),
             },
@@ -2182,6 +2283,82 @@ fn trade_consumes_queue(resting_side: ProbeSide, taker_side: ProbeSide) -> bool 
     )
 }
 
+fn planned_expiry_from_open(open_monotonic_ns: u64, planned_dwell_ms: u64) -> u64 {
+    open_monotonic_ns.saturating_add(planned_dwell_ms.saturating_mul(1_000_000))
+}
+
+fn phase_after_resting_post(current: ProbePhase) -> ProbePhase {
+    match current {
+        ProbePhase::PlacePending => ProbePhase::PostAccepted,
+        _ => current,
+    }
+}
+
+fn phase_after_filled_post(current: ProbePhase) -> ProbePhase {
+    match current {
+        ProbePhase::PlacePending | ProbePhase::PostAccepted | ProbePhase::Resting => {
+            ProbePhase::Filled
+        }
+        _ => current,
+    }
+}
+
+fn probe_distance_metrics(
+    market: &MarketState,
+    side: ProbeSide,
+    price: f64,
+    tick_size: f64,
+) -> ProbeDistanceMetrics {
+    if !price.is_finite() || price <= 0.0 || !tick_size.is_finite() || tick_size <= 0.0 {
+        return ProbeDistanceMetrics::default();
+    }
+    let Some((_, book)) = market.freshest_hl_book() else {
+        return ProbeDistanceMetrics::default();
+    };
+    let (Some(best_bid), Some(best_ask), Some(fair_value)) =
+        (book.best_bid(), book.best_ask(), book.midpoint())
+    else {
+        return ProbeDistanceMetrics::default();
+    };
+    let current_bbo_distance_ticks = match side {
+        ProbeSide::Bid => (best_bid - price) / tick_size,
+        ProbeSide::Ask => (price - best_ask) / tick_size,
+    };
+    let current_fair_value_distance_ticks = match side {
+        ProbeSide::Bid => (fair_value - price) / tick_size,
+        ProbeSide::Ask => (price - fair_value) / tick_size,
+    };
+    ProbeDistanceMetrics {
+        current_bbo_distance_ticks: Some(current_bbo_distance_ticks),
+        current_fair_value_distance_ticks: Some(current_fair_value_distance_ticks),
+        current_fair_value_distance_bps: Some(
+            current_fair_value_distance_ticks * tick_size / fair_value * 10_000.0,
+        ),
+        current_spread_ticks: Some((best_ask - best_bid) / tick_size),
+    }
+}
+
+fn realized_fee_metrics(
+    fee: Option<f64>,
+    price: f64,
+    size: f64,
+    tick_size: f64,
+) -> (Option<f64>, Option<f64>) {
+    let Some(fee) = fee.filter(|value| value.is_finite()) else {
+        return (None, None);
+    };
+    if !price.is_finite()
+        || price <= 0.0
+        || !size.is_finite()
+        || size <= 0.0
+        || !tick_size.is_finite()
+        || tick_size <= 0.0
+    {
+        return (None, None);
+    }
+    (Some(fee / (price * size)), Some(fee / (size * tick_size)))
+}
+
 fn recovery_request_due(phase: ProbePhase, now_ns: u64, not_before_ns: u64) -> bool {
     phase == ProbePhase::Recovering && now_ns >= not_before_ns
 }
@@ -2266,6 +2443,7 @@ fn start_rest_worker(
                 state.requests_surplus = None;
                 state.maker_fee = None;
                 state.taker_fee = None;
+                state.active_referral_discount = None;
                 state.lot_size = None;
                 state.size_decimals = None;
                 state.growth_mode = None;
@@ -2344,6 +2522,7 @@ fn start_rest_worker(
                 Some(Ok(fees)) => {
                     state.maker_fee = fees.userAddRate.parse().ok();
                     state.taker_fee = fees.userCrossRate.parse().ok();
+                    state.active_referral_discount = fees.activeReferralDiscount.parse().ok();
                     json!({
                         "userCrossRate": fees.userCrossRate,
                         "userAddRate": fees.userAddRate,
@@ -2548,6 +2727,68 @@ mod tests {
         assert!(trade_consumes_queue(ProbeSide::Ask, ProbeSide::Bid));
         assert!(!trade_consumes_queue(ProbeSide::Bid, ProbeSide::Bid));
         assert!(!trade_consumes_queue(ProbeSide::Ask, ProbeSide::Ask));
+    }
+
+    #[test]
+    fn dwell_expiry_starts_from_open_confirmation() {
+        assert_eq!(planned_expiry_from_open(5_000_000, 30_000), 30_005_000_000);
+        assert_eq!(planned_expiry_from_open(u64::MAX - 1, 30_000), u64::MAX);
+    }
+
+    #[test]
+    fn late_post_response_never_regresses_private_order_state() {
+        assert_eq!(
+            phase_after_resting_post(ProbePhase::PlacePending),
+            ProbePhase::PostAccepted
+        );
+        assert_eq!(
+            phase_after_resting_post(ProbePhase::Resting),
+            ProbePhase::Resting
+        );
+        assert_eq!(
+            phase_after_resting_post(ProbePhase::CancelPending),
+            ProbePhase::CancelPending
+        );
+        assert_eq!(
+            phase_after_filled_post(ProbePhase::MarkoutPending),
+            ProbePhase::MarkoutPending
+        );
+    }
+
+    #[test]
+    fn distance_metrics_preserve_side_and_staleness_sign() {
+        let mut market = MarketState::default();
+        market.hl_bbo.received_monotonic_ns = 10;
+        market.hl_bbo.bids.push(super::super::state::BookLevel {
+            price: 29_499.0,
+            size: 1.0,
+            order_count: Some(1),
+        });
+        market.hl_bbo.asks.push(super::super::state::BookLevel {
+            price: 29_500.0,
+            size: 1.0,
+            order_count: Some(1),
+        });
+
+        let bid = probe_distance_metrics(&market, ProbeSide::Bid, 29_494.0, 1.0);
+        assert_eq!(bid.current_bbo_distance_ticks, Some(5.0));
+        assert_eq!(bid.current_fair_value_distance_ticks, Some(5.5));
+        assert_eq!(bid.current_spread_ticks, Some(1.0));
+
+        let stale_ask = probe_distance_metrics(&market, ProbeSide::Ask, 29_498.0, 1.0);
+        assert_eq!(stale_ask.current_bbo_distance_ticks, Some(-2.0));
+        assert_eq!(stale_ask.current_fair_value_distance_ticks, Some(-1.5));
+    }
+
+    #[test]
+    fn realized_fee_is_available_as_rate_and_ticks() {
+        let (rate, ticks) = realized_fee_metrics(Some(0.000864), 30_000.0, 0.001, 1.0);
+        assert!((rate.unwrap() - 0.0000288).abs() < 1e-12);
+        assert!((ticks.unwrap() - 0.864).abs() < 1e-12);
+        assert_eq!(
+            realized_fee_metrics(None, 30_000.0, 0.001, 1.0),
+            (None, None)
+        );
     }
 
     #[test]

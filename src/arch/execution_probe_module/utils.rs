@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -265,13 +267,15 @@ pub fn make_cloid(run_id: &str, probe_sequence: u64) -> String {
     hash.update(run_id.as_bytes());
     hash.update(probe_sequence.to_be_bytes());
     let digest = hash.finalize();
-    format!(
-        "0x{}",
-        digest[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    )
+    format!("0x{}", lower_hex(&digest[..16]))
+}
+
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 pub fn hyperliquid_tick_size(price: f64, size_decimals: u32) -> Option<f64> {
@@ -379,7 +383,7 @@ fn default_max_abs_inventory() -> f64 {
     20.0
 }
 fn default_price_levels() -> Vec<u32> {
-    vec![0, 1]
+    vec![0, 1, 2, 3, 5, 8]
 }
 fn default_dwell_seconds() -> Vec<u64> {
     vec![30, 60, 120, 300]
@@ -412,10 +416,10 @@ fn default_fair_value_guard_ticks() -> f64 {
     2.0
 }
 fn default_behavior_seed() -> u64 {
-    20_260_827
+    20_260_829
 }
 fn default_behavior_policy_id() -> String {
-    "uniform_probe_v1".into()
+    "uniform_distance_dwell_v2".into()
 }
 
 #[cfg(test)]
@@ -448,6 +452,11 @@ mod tests {
     }
 
     #[test]
+    fn encodes_lowercase_hex_with_leading_zeroes() {
+        assert_eq!(lower_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    #[test]
     fn example_config_is_valid_and_collection_only() {
         let config = AppConfig::load(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -457,6 +466,9 @@ mod tests {
         assert!(!config.probe.enabled);
         assert!(!config.probe.i_understand_live_orders);
         assert_eq!(config.markets.hyperliquid_coin, "xyz:XYZ100");
+        assert_eq!(config.probe.price_levels_ticks, [0, 1, 2, 3, 5, 8]);
+        assert_eq!(config.probe.dwell_seconds, [30, 60, 120, 300]);
+        assert_eq!(config.probe.behavior_policy_id, "uniform_distance_dwell_v2");
     }
 
     #[test]
